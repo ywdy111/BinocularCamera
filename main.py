@@ -33,7 +33,7 @@ CALIB_PATH_CONFIG = CALIB_DIR / "calib_path.json"
 DEFAULT_EXPOSURE_US = 8000
 DEFAULT_GAIN = 0
 DEFAULT_PROJECTOR_EXPOSURE_US = 8000
-DEFAULT_PROJECTOR_BRIGHTNESS = 40
+DEFAULT_PROJECTOR_BRIGHTNESS = 35
 PROJECTOR_WARMUP_START_FRAME = 0
 PROJECTOR_WARMUP_PATTERN_COUNT = 12
 PREVIEW_TIMEOUT_MS = 50
@@ -45,7 +45,7 @@ STRIPE_OPTIONS = (
     (54, 12),  # 三频四步:   3 * 4
     (66, 9),   # 三频三步:   3 * 3
     (75, 9),   # 互补格雷码: 4 phase + 4 gray + 1 complementary gray
-    (84, 8),   # 双频四步:   2 * 4
+    (84, 14),  # 自定义: 2 * 4 + 1 * 6
 )
 
 
@@ -113,6 +113,7 @@ class ScanWorker(QtCore.QThread):
             if cam_projector.CLEAR_BUFFER_BEFORE_TRIGGER:
                 cam_projector.clear_stereo_buffers(self.left_camera, self.right_camera)
 
+            projection_start = time.monotonic()
             cam_projector.trigger_burned_pattern_sequence(self.projector)
             sequence_start = time.monotonic()
 
@@ -139,6 +140,7 @@ class ScanWorker(QtCore.QThread):
                 left_save_dir,
                 right_save_dir,
             )
+            capture_save_ms = (time.monotonic() - projection_start) * 1000.0
 
             remaining_wait_s = cam_projector.PROJECTION_WAIT_S - (
                 time.monotonic() - sequence_start
@@ -151,11 +153,20 @@ class ScanWorker(QtCore.QThread):
             except Exception:
                 pass
 
-            structured_light_rebuild.reconstruct_capture(
+            rebuild_dir, timing = structured_light_rebuild.reconstruct_capture(
                 capture_dir,
                 self.stripe_index,
                 calib_path=self.calib_path,
             )
+
+            total_ms = (time.monotonic() - projection_start) * 1000.0
+            timing.update(
+                {
+                    "capture_save_ms": capture_save_ms,
+                    "total_ms": total_ms,
+                }
+            )
+            structured_light_rebuild.save_timing_stats(rebuild_dir / "timing_stats.txt", timing)
 
             self.finished_ok.emit(str(capture_dir))
         except Exception as exc:
@@ -803,7 +814,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         criteria = (
             cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-            100,
+            30,
             1e-6,
         )
         object_template = np.zeros((board_size[0] * board_size[1], 3), np.float32)
@@ -871,7 +882,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             dist_r,
             image_size,
             criteria=criteria,
-            flags=cv2.CALIB_FIX_INTRINSIC,
+            flags=cv2.CALIB_USE_INTRINSIC_GUESS,
         )
         return {
             "image_size": image_size,
@@ -906,10 +917,11 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             format_named_matrix("RadialDistortion_R", np.array([radial_r], dtype=np.float64)),
             format_named_matrix("TangentialDistortion_L", np.array([tangent_l], dtype=np.float64)),
             format_named_matrix("TangentialDistortion_R", np.array([tangent_r], dtype=np.float64)),
-            format_named_matrix("R", np.asarray(result["R"], dtype=np.float64)),
-            format_named_matrix("T", np.asarray(result["T"], dtype=np.float64).reshape(1, 3)),
+            format_named_matrix("R", np.asarray(result["R"], dtype=np.float64).T),
+            format_named_matrix("T", np.asarray(result["T"], dtype=np.float64).reshape(3, 1).T),
             format_named_matrix("E", np.asarray(result["E"], dtype=np.float64)),
             format_named_matrix("F", np.asarray(result["F"], dtype=np.float64)),
+            "error_stereo\n%.8g\n" % float(result["error"]),
             "error\n%.8g\n" % float(result["error"]),
         ]
         path.write_text("\n".join(parts), encoding="utf-8")

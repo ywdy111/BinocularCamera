@@ -41,7 +41,7 @@ def generate_dual_frequency_patterns(width=1280, height=720, p1=80, p2=40, out_d
 def generate_cgc_patterns(width=1280, height=720, periods=16, out_dir="config\\data_stripe\\patterns_9_frames_cgc"):
     """
     生成 9 张互补格雷码高精度条纹图
-    包含: 4步相移 + 4级基础格雷码 + 1张互补格雷码
+    包含: 4步相移 + 4级基础格雷码 + 1张互补格雷码(完美对齐版)
     """
     os.makedirs(out_dir, exist_ok=True)
     P = width / periods
@@ -69,17 +69,17 @@ def generate_cgc_patterns(width=1280, height=720, periods=16, out_dir="config\\d
         cv2.imwrite(filename, pattern_2d)
         print(f"  已生成格雷码: {filename}")
 
-    # 3. 1 张互补格雷码
+    # 3. 1 张互补码 (完美对齐修正版)
+    # 本质是一个周期为 2P 的二进制方波，向左偏移 P/2
+    # 确保跳变沿极其精确地落在 0.5P, 1.5P, 2.5P... 的位置
     region_idx_comp = ((x + P / 2) / P).astype(int)
-    gray_code_comp = region_idx_comp ^ (region_idx_comp >> 1)
-    comp_val = ((gray_code_comp >> 0) & 1) * 255
+    comp_val = (region_idx_comp % 2) * 255
     pattern_2d = np.tile(comp_val, (height, 1)).astype(np.uint8)
     filename = os.path.join(out_dir, f"09_complementary_gray.bmp")
     cv2.imwrite(filename, pattern_2d)
     print(f"  已生成互补码: {filename}")
     
     print(f"-> 全部 9 张图像已保存至 '{out_dir}'\n")
-
 
 # ==========================================
 # 通用多频多步生成器 (内部调用)
@@ -144,20 +144,20 @@ if __name__ == "__main__":
     
     # 你可以取消注释来生成对应的条纹图集：
     
-    # 1. 生成双频四步
-    generate_dual_frequency_patterns(width=W, height=H, p1=80, p2=40)
+    # # 1. 生成双频四步
+    # generate_dual_frequency_patterns(width=W, height=H, p1=80, p2=40)
     
     # 2. 生成互补格雷码 (9张图)
-    generate_cgc_patterns(width=W, height=H, periods=16)
+    # generate_cgc_patterns(width=W, height=H, periods=16)
     
-    # 3. 生成三频十二步 (36张图)
-    generate_3freq_12step_patterns(width=W, height=H, periods=[70, 75, 80])
+    # # 3. 生成三频十二步 (36张图)
+    # generate_3freq_12step_patterns(width=W, height=H, periods=[70, 75, 80])
     
-    # 4. 生成三频六步 (18张图)
-    generate_3freq_6step_patterns(width=W, height=H, periods=[70, 75, 80])
+    # # 4. 生成三频六步 (18张图)
+    generate_3freq_6step_patterns(width=W, height=H, periods=[160, 75, 80])
     
-    # 5. 生成三频四步 (12张图)
-    generate_3freq_4step_patterns(width=W, height=H, periods=[70, 75, 80])
+    # # 5. 生成三频四步 (12张图)
+    # generate_3freq_4step_patterns(width=W, height=H, periods=[70, 75, 80])
     
-    # 6. 生成三频三步 (9张图)
-    generate_3freq_3step_patterns(width=W, height=H, periods=[70, 75, 80])
+    # # 6. 生成三频三步 (9张图)
+    # generate_3freq_3step_patterns(width=W, height=H, periods=[70, 75, 80])

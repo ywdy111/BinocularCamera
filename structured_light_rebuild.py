@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
 import cv2
 import numpy as np
+
+try:
+    from numba import njit, prange
+except Exception:  # pragma: no cover - optional acceleration
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
+    prange = range
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -17,6 +30,13 @@ TWO_PI = 2.0 * np.pi
 POINT_CLOUD_Z_MIN_MM = 300.0
 POINT_CLOUD_Z_MAX_MM = 500.0
 POINT_CLOUD_MIN_COMPONENT_PIXELS = 64
+MIN_PHASE_MODULATION = 8.0
+MIN_PHASE_INTENSITY_SWING = 16.0
+PHASE_MODULATION_RELATIVE_THRESHOLD = 0.15
+PHASE_SWING_RELATIVE_THRESHOLD = 0.12
+PHASE_JUMP_THRESHOLD = 1.5 * TWO_PI
+PIXEL_JUMP_THRESHOLD = 32.0
+RECTIFIED_CHECK_LINE_COUNT = 8
 
 
 @dataclass(frozen=True)
@@ -28,6 +48,7 @@ class StripeConfig:
     mode: str
     do_reconstruct: bool = True
     projector_width: int = 1280
+    wrapped_steps: tuple[int, ...] = ()
 
 
 STRIPE_CONFIGS = {
@@ -36,7 +57,7 @@ STRIPE_CONFIGS = {
     2: StripeConfig("three_frequency_four_step", "three_frequency_4step", 4, (70, 75, 80), "multi_frequency"),
     3: StripeConfig("three_frequency_three_step", "three_frequency_3step", 3, (70, 75, 80), "multi_frequency"),
     4: StripeConfig("complementary_gray_code", "complementary_gray_code", 4, (16,), "gray_code"),
-    5: StripeConfig("dual_frequency_custom", "dual_frequency_custom", 4, (80, 40), "wrapped_only", False),
+    5: StripeConfig("dual_frequency_custom", "dual_frequency_custom", 0, (80, 160, 160), "wrapped_only", False, wrapped_steps=(4, 4, 6)),
 }
 
 
@@ -44,12 +65,16 @@ def reconstruct_capture(
     capture_dir: Union[Path, str],
     stripe_index: int,
     calib_path: Union[Path, str] = DEFAULT_CALIB_PATH,
-) -> Path:
+) -> tuple[Path, dict[str, float]]:
     config = STRIPE_CONFIGS[int(stripe_index)]
     capture_path = Path(capture_dir)
     output_dir = capture_path / "rebuild"
     output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_rebuild_outputs(output_dir)
 
+    timing: dict[str, float] = {}
+
+    decode_start = time.monotonic()
     left_images = load_capture_images(capture_path / LEFT_DIR_NAME)
     right_images = load_capture_images(capture_path / RIGHT_DIR_NAME)
     white_left, pattern_left = split_white_and_patterns(left_images, expected_pattern_count(config))
@@ -57,14 +82,21 @@ def reconstruct_capture(
 
     left_result = decode_patterns(pattern_left, config, white_left, output_dir / "left")
     right_result = decode_patterns(pattern_right, config, white_right, output_dir / "right")
+    timing["phase_decode_ms"] = (time.monotonic() - decode_start) * 1000.0
 
     if config.do_reconstruct:
-        build_point_cloud(
+        reconstruct_start = time.monotonic()
+        timing.update(build_point_cloud(
             calib_path=Path(calib_path),
             output_dir=output_dir,
-        )
+        ))
+        timing["reconstruct_ms"] = (time.monotonic() - reconstruct_start) * 1000.0
+    else:
+        timing["absolute_phase_ms"] = 0.0
+        timing["reconstruct_ms"] = 0.0
+        timing["point_cloud_ms"] = 0.0
 
-    return output_dir
+    return output_dir, timing
 
 
 def expected_pattern_count(config: StripeConfig) -> int:
@@ -73,8 +105,45 @@ def expected_pattern_count(config: StripeConfig) -> int:
     if config.mode == "gray_code":
         return 9
     if config.mode == "wrapped_only":
-        return config.phase_steps * len(config.cycles)
+        return sum(wrapped_only_steps(config))
     raise ValueError("Unsupported stripe mode: %s" % config.mode)
+
+
+def wrapped_only_steps(config: StripeConfig) -> tuple[int, ...]:
+    if config.wrapped_steps:
+        return config.wrapped_steps
+    return tuple([config.phase_steps] * len(config.cycles))
+
+
+def cleanup_rebuild_outputs(output_dir: Path) -> None:
+    patterns = [
+        "disparity.png",
+        "point_cloud.ply",
+        "point_cloud_points.npy",
+        "point_cloud_filter_stats.txt",
+        "rectified_phase_pair.png",
+        "rectified_valid_mask.png",
+        "rectified_valid_stats.txt",
+    ]
+    side_patterns = [
+        "wrapped_phase_*.npy",
+        "wrapped_phase_*.png",
+        "modulation_*.png",
+        "projector_coord.npy",
+        "gray_period_index.png",
+    ]
+    for pattern in patterns:
+        for path in output_dir.glob(pattern):
+            if path.is_file():
+                path.unlink()
+    for side in ("left", "right"):
+        side_dir = output_dir / side
+        if not side_dir.exists():
+            continue
+        for pattern in side_patterns:
+            for path in side_dir.glob(pattern):
+                if path.is_file():
+                    path.unlink()
 
 
 def load_capture_images(image_dir: Path) -> list[np.ndarray]:
@@ -140,16 +209,19 @@ def decode_multi_frequency(
     white_image: np.ndarray,
     output_dir: Path,
 ) -> dict[str, np.ndarray]:
+    groups = [
+        images[index * config.phase_steps : (index + 1) * config.phase_steps]
+        for index in range(len(config.cycles))
+    ]
+    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        results = list(executor.map(_phase_shift_group, [(group, white_image) for group in groups]))
+
     wrapped_maps: list[np.ndarray] = []
     valid_maps: list[np.ndarray] = []
-    for index, cycles in enumerate(config.cycles):
-        start = index * config.phase_steps
-        group = images[start : start + config.phase_steps]
-        wrapped, modulation, valid = phase_shift(group, white_image)
+    for cycles, (wrapped, modulation, valid) in zip(config.cycles, results):
         wrapped_maps.append(wrapped)
         valid_maps.append(valid)
-        save_phase(output_dir / ("wrapped_phase_f%d" % cycles), wrapped, valid, period=TWO_PI)
-        save_float_image(output_dir / ("modulation_f%d.png" % cycles), modulation, valid)
+        save_phase_npy(output_dir / ("wrapped_phase_f%d" % cycles), wrapped, valid)
 
     valid = np.logical_and.reduce(valid_maps)
     projector_coord = unwrap_multi_frequency(
@@ -160,7 +232,6 @@ def decode_multi_frequency(
     )
     unwrapped_phase = (projector_coord / float(config.cycles[0])) * TWO_PI
     save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
-    np.save(str(output_dir / "projector_coord.npy"), projector_coord.astype(np.float32))
     return {
         "wrapped": wrapped_maps[0],
         "unwrapped": unwrapped_phase,
@@ -175,21 +246,19 @@ def decode_three_step_frequency(
     white_image: np.ndarray,
     output_dir: Path,
 ) -> dict[str, np.ndarray]:
+    groups = [
+        images[index * config.phase_steps : (index + 1) * config.phase_steps]
+        for index in range(len(config.cycles))
+    ]
+    with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        results = list(executor.map(_phase_shift_group, [(group, white_image) for group in groups]))
+
     wrapped_maps: list[np.ndarray] = []
     valid_maps: list[np.ndarray] = []
-    for index, period in enumerate(config.cycles):
-        start = index * config.phase_steps
-        first, second, third = images[start : start + config.phase_steps]
-        wrapped, modulation, valid = phase_shift_three_step_images(
-            first,
-            second,
-            third,
-            white_image,
-        )
+    for period, (wrapped, modulation, valid) in zip(config.cycles, results):
         wrapped_maps.append(wrapped)
         valid_maps.append(valid)
-        save_phase(output_dir / ("wrapped_phase_f%d" % period), wrapped, valid, period=TWO_PI)
-        save_float_image(output_dir / ("modulation_f%d.png" % period), modulation, valid)
+        save_phase_npy(output_dir / ("wrapped_phase_f%d" % period), wrapped, valid)
 
     valid = np.logical_and.reduce(valid_maps)
     projector_coord = unwrap_multi_frequency(
@@ -200,7 +269,6 @@ def decode_three_step_frequency(
     )
     unwrapped_phase = (projector_coord / float(config.cycles[0])) * TWO_PI
     save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
-    np.save(str(output_dir / "projector_coord.npy"), projector_coord.astype(np.float32))
     return {
         "wrapped": wrapped_maps[0],
         "unwrapped": unwrapped_phase,
@@ -226,30 +294,31 @@ def decode_gray_code(
     gray_value = np.zeros_like(bits[0], dtype=np.uint8)
     for bit in bits:
         gray_value = (gray_value << 1) | bit
-    period_index = gray_to_binary(gray_value)
-    phase_fraction = wrapped / TWO_PI
     comp_bit = (complementary > threshold).astype(np.uint8)
-    period_index = correct_with_complementary_gray(
-        period_index,
-        phase_fraction,
+    period_index = decode_complementary_gray_order(
+        gray_value,
+        wrapped,
         comp_bit,
         period_count,
     )
 
-    gray_valid = period_index < period_count
+    phase_period = float(config.projector_width) / float(period_count)
+    unwrapped_phase = wrapped + period_index.astype(np.float32) * TWO_PI
+    gray_valid = (
+        (period_index >= 0)
+        & (period_index < int(period_count))
+        & np.isfinite(unwrapped_phase)
+        & (unwrapped_phase >= 0.0)
+        & (unwrapped_phase < float(period_count) * TWO_PI)
+    )
     valid = phase_valid & gray_valid
 
-    phase_period = float(config.projector_width) / float(period_count)
-    projector_coord = (period_index.astype(np.float32) + phase_fraction) * phase_period
+    projector_coord = (unwrapped_phase / TWO_PI) * phase_period
     projector_coord[~valid] = np.nan
-    unwrapped_phase = (period_index.astype(np.float32) + phase_fraction) * TWO_PI
     unwrapped_phase[~valid] = np.nan
 
-    save_phase(output_dir / "wrapped_phase_f16", wrapped, phase_valid, period=TWO_PI)
-    save_float_image(output_dir / "modulation_f16.png", modulation, phase_valid)
+    save_phase_npy(output_dir / "wrapped_phase_f16", wrapped, phase_valid)
     save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
-    save_float_image(output_dir / "gray_period_index.png", period_index.astype(np.float32), gray_valid)
-    np.save(str(output_dir / "projector_coord.npy"), projector_coord.astype(np.float32))
     return {
         "wrapped": wrapped,
         "unwrapped": unwrapped_phase,
@@ -265,12 +334,22 @@ def decode_wrapped_only(
     output_dir: Path,
 ) -> dict[str, np.ndarray]:
     first_result: Optional[dict[str, np.ndarray]] = None
-    for index, cycles in enumerate(config.cycles):
-        start = index * config.phase_steps
-        group = images[start : start + config.phase_steps]
+    duplicate_cycles = len(set(config.cycles)) != len(config.cycles)
+    start = 0
+    for cycles, steps in zip(config.cycles, wrapped_only_steps(config)):
+        group = images[start : start + steps]
+        start += steps
+        if len(group) != steps:
+            raise RuntimeError("Need %d frames for wrapped phase P%d, got %d" % (steps, cycles, len(group)))
         wrapped, modulation, valid = phase_shift(group, white_image)
-        save_phase(output_dir / ("wrapped_phase_f%d" % cycles), wrapped, valid, period=TWO_PI)
-        save_float_image(output_dir / ("modulation_f%d.png" % cycles), modulation, valid)
+        base_name = "wrapped_phase_f%d_step%d" % (cycles, steps) if duplicate_cycles else "wrapped_phase_f%d" % cycles
+        save_phase(output_dir / base_name, wrapped, valid)
+        save_phase_npy(output_dir / base_name, wrapped, valid)
+        save_wrapped_phase_binary_outputs(
+            output_dir / base_name,
+            wrapped,
+            valid,
+        )
         if first_result is None:
             projector_coord = (wrapped / TWO_PI) * float(cycles)
             projector_coord[~valid] = np.nan
@@ -305,6 +384,11 @@ def phase_shift(
     return wrapped, modulation.astype(np.float32), valid
 
 
+def _phase_shift_group(args: tuple[Sequence[np.ndarray], np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    group, white_image = args
+    return phase_shift(group, white_image)
+
+
 def phase_shift_three_step_images(
     first: np.ndarray,
     second: np.ndarray,
@@ -326,13 +410,23 @@ def build_valid_mask(
     modulation: np.ndarray,
 ) -> np.ndarray:
     average = np.mean(stack, axis=0)
+    intensity_swing = np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)
     white_threshold = max(8.0, float(np.nanpercentile(white_image, 10)) * 0.25)
-    modulation_threshold = max(3.0, float(np.nanpercentile(modulation, 75)) * 0.08)
+    modulation_threshold = max(
+        MIN_PHASE_MODULATION,
+        float(np.nanpercentile(modulation, 95)) * PHASE_MODULATION_RELATIVE_THRESHOLD,
+    )
+    swing_threshold = max(
+        MIN_PHASE_INTENSITY_SWING,
+        float(np.nanpercentile(intensity_swing, 95)) * PHASE_SWING_RELATIVE_THRESHOLD,
+    )
     return (
         np.isfinite(average)
         & np.isfinite(modulation)
+        & np.isfinite(intensity_swing)
         & (white_image > white_threshold)
         & (modulation > modulation_threshold)
+        & (intensity_swing > swing_threshold)
     )
 
 
@@ -342,6 +436,23 @@ def unwrap_multi_frequency(
     valid: np.ndarray,
     projector_width: int,
 ) -> np.ndarray:
+    if len(wrapped_maps) == 3 and len(periods) == 3:
+        residue0 = (np.mod(wrapped_maps[0], TWO_PI) / TWO_PI) * float(periods[0])
+        residue1 = (np.mod(wrapped_maps[1], TWO_PI) / TWO_PI) * float(periods[1])
+        residue2 = (np.mod(wrapped_maps[2], TWO_PI) / TWO_PI) * float(periods[2])
+        max_order = int(np.ceil(float(projector_width) / float(periods[0]))) + 2
+        return unwrap_multi_frequency_parallel(
+            residue0.astype(np.float32),
+            residue1.astype(np.float32),
+            residue2.astype(np.float32),
+            valid.astype(np.bool_),
+            np.int32(max_order),
+            np.float32(periods[0]),
+            np.float32(periods[1]),
+            np.float32(periods[2]),
+            np.float32(projector_width),
+        )
+
     residues = [
         (np.mod(phase, TWO_PI) / TWO_PI) * float(period)
         for phase, period in zip(wrapped_maps, periods)
@@ -384,32 +495,236 @@ def gray_to_binary(gray: np.ndarray) -> np.ndarray:
     return binary
 
 
-def correct_with_complementary_gray(
-    period_index: np.ndarray,
-    phase_fraction: np.ndarray,
+def decode_complementary_gray_order(
+    gray_value: np.ndarray,
+    wrapped_phase: np.ndarray,
     comp_bit: np.ndarray,
     period_count: int,
 ) -> np.ndarray:
-    shifted_index = period_index + (phase_fraction >= 0.5).astype(np.uint8)
-    expected_comp = gray_lsb(shifted_index)
-    mismatch = comp_bit != expected_comp
+    switch_phase = wrap_to_pi(wrapped_phase - np.pi)
+    base_order = gray_to_binary(gray_value).astype(np.int16)
+    k1 = np.clip(base_order, 0, int(period_count) - 1)
 
-    corrected = period_index.astype(np.int16)
-    corrected[mismatch & (phase_fraction < 0.5)] += 1
-    corrected[mismatch & (phase_fraction >= 0.5)] -= 1
-    corrected = np.clip(corrected, 0, int(period_count) - 1)
-    return corrected.astype(np.uint8)
+    k2_same = np.clip(base_order, 0, int(period_count))
+    k2_next = np.clip(base_order + 1, 0, int(period_count))
+    k2 = np.where((k2_same & 1) == comp_bit.astype(np.int16), k2_same, k2_next)
+
+    order = np.empty(base_order.shape, dtype=np.int16)
+    first_region = switch_phase < (-0.5 * np.pi)
+    middle_region = (switch_phase >= (-0.5 * np.pi)) & (switch_phase <= (0.5 * np.pi))
+    order[first_region] = k2[first_region]
+    order[middle_region] = k1[middle_region]
+    order[~(first_region | middle_region)] = k2[~(first_region | middle_region)] - 1
+    return np.clip(order, 0, int(period_count) - 1).astype(np.int16)
 
 
-def gray_lsb(binary_value: np.ndarray) -> np.ndarray:
-    gray = binary_value ^ (binary_value >> 1)
-    return (gray & 1).astype(np.uint8)
+def wrap_to_pi(phase: np.ndarray) -> np.ndarray:
+    return (np.mod(phase + np.pi, TWO_PI) - np.pi).astype(np.float32)
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def unwrap_multi_frequency_parallel(
+    residue0: np.ndarray,
+    residue1: np.ndarray,
+    residue2: np.ndarray,
+    valid: np.ndarray,
+    max_order: np.int32,
+    period0: np.float32,
+    period1: np.float32,
+    period2: np.float32,
+    projector_width: np.float32,
+) -> np.ndarray:
+    height, width = residue0.shape
+    best_coord = np.empty((height, width), dtype=np.float32)
+    for row in prange(height):
+        for col in range(width):
+            if not valid[row, col]:
+                best_coord[row, col] = np.nan
+                continue
+
+            base = residue0[row, col]
+            best_score = np.float32(np.inf)
+            best_value = np.float32(np.nan)
+
+            for order in range(max_order):
+                candidate = base + np.float32(order) * period0
+                if candidate < 0.0 or candidate >= projector_width:
+                    continue
+
+                err1 = circular_period_distance_scalar(candidate, residue1[row, col], period1)
+                err2 = circular_period_distance_scalar(candidate, residue2[row, col], period2)
+                score = err1 * err1 + err2 * err2
+                if score < best_score:
+                    best_score = score
+                    best_value = candidate
+
+            best_coord[row, col] = best_value
+
+    return best_coord
+
+
+@njit(cache=True, fastmath=True)
+def circular_period_distance_scalar(coordinate: np.float32, residue: np.float32, period: np.float32) -> np.float32:
+    half_period = np.float32(0.5) * period
+    return np.float32(np.abs(((coordinate - residue + half_period) % period) - half_period))
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def match_phase_to_disparity_parallel(
+    left_coord: np.ndarray,
+    right_coord: np.ndarray,
+    left_valid: np.ndarray,
+    right_valid: np.ndarray,
+) -> np.ndarray:
+    height, width = left_coord.shape
+    disparity = np.empty((height, width), dtype=np.float32)
+    x_grid = np.arange(width, dtype=np.float32)
+
+    for row in prange(height):
+        for col in range(width):
+            disparity[row, col] = np.nan
+
+        right_count = 0
+        left_count = 0
+        for col in range(width):
+            if right_valid[row, col] and np.isfinite(right_coord[row, col]):
+                right_count += 1
+            if left_valid[row, col] and np.isfinite(left_coord[row, col]):
+                left_count += 1
+
+        if right_count < 2 or left_count == 0:
+            continue
+
+        right_phase = np.empty(right_count, dtype=np.float32)
+        right_x = np.empty(right_count, dtype=np.float32)
+        idx = 0
+        for col in range(width):
+            if right_valid[row, col] and np.isfinite(right_coord[row, col]):
+                right_phase[idx] = right_coord[row, col]
+                right_x[idx] = x_grid[col]
+                idx += 1
+
+        order = np.argsort(right_phase)
+        sorted_phase = np.empty(right_count, dtype=np.float32)
+        sorted_x = np.empty(right_count, dtype=np.float32)
+        for i in range(right_count):
+            sorted_phase[i] = right_phase[order[i]]
+            sorted_x[i] = right_x[order[i]]
+
+        unique_phase = np.empty(right_count, dtype=np.float32)
+        unique_x = np.empty(right_count, dtype=np.float32)
+        unique_count = 0
+        unique_phase[0] = sorted_phase[0]
+        unique_x[0] = sorted_x[0]
+        unique_count = 1
+        for i in range(1, right_count):
+            if sorted_phase[i] != unique_phase[unique_count - 1]:
+                unique_phase[unique_count] = sorted_phase[i]
+                unique_x[unique_count] = sorted_x[i]
+                unique_count += 1
+
+        if unique_count < 2:
+            continue
+
+        min_phase = unique_phase[0]
+        max_phase = unique_phase[unique_count - 1]
+
+        for col in range(width):
+            if not (left_valid[row, col] and np.isfinite(left_coord[row, col])):
+                continue
+
+            phase = left_coord[row, col]
+            if phase < min_phase or phase > max_phase:
+                continue
+
+            insert_idx = phase_binary_search(unique_phase, unique_count, phase)
+            if insert_idx <= 0:
+                insert_idx = 1
+            elif insert_idx >= unique_count:
+                insert_idx = unique_count - 1
+
+            phase_gap = unique_phase[insert_idx] - unique_phase[insert_idx - 1]
+            x_gap = np.abs(unique_x[insert_idx] - unique_x[insert_idx - 1])
+            if phase_gap > PHASE_JUMP_THRESHOLD or x_gap > PIXEL_JUMP_THRESHOLD:
+                continue
+
+            p0 = unique_phase[insert_idx - 1]
+            p1 = unique_phase[insert_idx]
+            x0 = unique_x[insert_idx - 1]
+            x1 = unique_x[insert_idx]
+            if p1 == p0:
+                matched_x = x0
+            else:
+                matched_x = x0 + (phase - p0) * (x1 - x0) / (p1 - p0)
+            disparity[row, col] = x_grid[col] - matched_x
+
+    return disparity
+
+
+@njit(cache=True, fastmath=True)
+def phase_binary_search(values: np.ndarray, count: int, target: float) -> int:
+    lo = 0
+    hi = count
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if values[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def calculate_xyz_parallel(
+    disparity: np.ndarray,
+    Q: np.ndarray,
+    min_depth: np.float32,
+    max_depth: np.float32,
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = disparity.shape
+    points = np.empty((height, width, 3), dtype=np.float32)
+    base_valid = np.zeros((height, width), dtype=np.bool_)
+
+    q03 = np.float32(Q[0, 3])
+    q13 = np.float32(Q[1, 3])
+    q23 = np.float32(Q[2, 3])
+    q32 = np.float32(Q[3, 2])
+    q33 = np.float32(Q[3, 3])
+
+    for row in prange(height):
+        for col in range(width):
+            d = disparity[row, col]
+            if not np.isfinite(d) or np.abs(d) <= np.float32(1e-6):
+                points[row, col, 0] = np.nan
+                points[row, col, 1] = np.nan
+                points[row, col, 2] = np.nan
+                continue
+
+            w0 = q32 * d + q33
+            if np.abs(w0) <= np.float32(1e-12):
+                points[row, col, 0] = np.nan
+                points[row, col, 1] = np.nan
+                points[row, col, 2] = np.nan
+                continue
+
+            x = (np.float32(col) + q03) / w0
+            y = (np.float32(row) + q13) / w0
+            z = q23 / w0
+            points[row, col, 0] = x
+            points[row, col, 1] = y
+            points[row, col, 2] = z
+            if min_depth < z < max_depth:
+                base_valid[row, col] = True
+
+    return points, base_valid
 
 
 def build_point_cloud(
     calib_path: Path,
     output_dir: Path,
-) -> None:
+) -> dict[str, float]:
+    timing: dict[str, float] = {}
+    phase_to_abs_start = time.monotonic()
     left_phase, left_valid = load_unwrapped_phase_npy(output_dir / "left" / "unwrapped_phase.npy")
     right_phase, right_valid = load_unwrapped_phase_npy(output_dir / "right" / "unwrapped_phase.npy")
     if left_phase.shape != right_phase.shape:
@@ -428,23 +743,26 @@ def build_point_cloud(
         calib,
         (width, height),
     )
-    disparity = match_phase_to_disparity(
+    timing["absolute_phase_ms"] = (time.monotonic() - phase_to_abs_start) * 1000.0
+
+    reconstruct_start = time.monotonic()
+    disparity = match_phase_to_disparity_parallel(
         rectified["left_coord"],
         rectified["right_coord"],
         rectified["left_valid"],
         rectified["right_valid"],
     )
     np.save(str(output_dir / "disparity.npy"), disparity.astype(np.float32))
-    save_float_image(output_dir / "disparity.png", disparity, np.isfinite(disparity))
-
-    points = cv2.reprojectImageTo3D(disparity.astype(np.float32), rectified["Q"])
-    base_valid = np.isfinite(disparity) & np.isfinite(points).all(axis=2) & (np.abs(disparity) > 1e-6)
+    points, base_valid = calculate_xyz_parallel(
+        disparity.astype(np.float32),
+        rectified["Q"].astype(np.float64),
+        np.float32(POINT_CLOUD_Z_MIN_MM),
+        np.float32(POINT_CLOUD_Z_MAX_MM),
+    )
     valid = filter_point_cloud_valid_mask(points, base_valid)
-    colors = normalize_to_uint8(rectified["left_coord"], rectified["left_valid"])
-    save_ply(output_dir / "point_cloud.ply", points, valid, colors)
     save_point_cloud_txt(output_dir / "point_cloud.txt", points, valid)
-    np.save(str(output_dir / "point_cloud_points.npy"), points[valid].astype(np.float32))
-    save_point_cloud_filter_stats(output_dir / "point_cloud_filter_stats.txt", points, base_valid, valid)
+    timing["point_cloud_ms"] = (time.monotonic() - reconstruct_start) * 1000.0
+    return timing
 
 
 def load_unwrapped_phase_npy(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -485,25 +803,6 @@ def filter_point_cloud_valid_mask(points: np.ndarray, valid: np.ndarray) -> np.n
     return np.isin(labels, keep_labels)
 
 
-def save_point_cloud_filter_stats(
-    path: Path,
-    points: np.ndarray,
-    base_valid: np.ndarray,
-    valid: np.ndarray,
-) -> None:
-    z = points[:, :, 2]
-    z_range = base_valid & (z >= POINT_CLOUD_Z_MIN_MM) & (z <= POINT_CLOUD_Z_MAX_MM)
-    lines = [
-        "z_min_mm=%.3f" % POINT_CLOUD_Z_MIN_MM,
-        "z_max_mm=%.3f" % POINT_CLOUD_Z_MAX_MM,
-        "min_component_pixels=%d" % POINT_CLOUD_MIN_COMPONENT_PIXELS,
-        "base_valid_points=%d" % int(np.count_nonzero(base_valid)),
-        "z_range_points=%d" % int(np.count_nonzero(z_range)),
-        "saved_points=%d" % int(np.count_nonzero(valid)),
-    ]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def load_calibration(calib_path: Path) -> dict[str, np.ndarray]:
     text = calib_path.read_text(encoding="utf-8")
     return {
@@ -518,8 +817,8 @@ def load_calibration(calib_path: Path) -> dict[str, np.ndarray]:
             read_named_matrix(text, "RadialDistortion_R"),
             read_named_matrix(text, "TangentialDistortion_R"),
         ),
-        "R": read_named_matrix(text, "R"),
-        "T": read_named_matrix(text, "T").reshape(3, 1),
+        "R": read_named_matrix(text, "R").T.copy(),
+        "T": read_named_matrix(text, "T").T.reshape(3, 1),
     }
 
 
@@ -569,9 +868,11 @@ def rectify_phase_pair(
         image_size,
         calib["R"],
         calib["T"],
-        flags=cv2.CALIB_ZERO_DISPARITY,
-        alpha=0,
+        flags=0,
+        alpha=-1,
+        newImageSize=image_size,
     )
+    Q = left_rectification_to_world_matrix(R1) @ Q
     map1x, map1y = cv2.initUndistortRectifyMap(
         calib["K1"],
         calib["dist1"],
@@ -588,13 +889,25 @@ def rectify_phase_pair(
         image_size,
         cv2.CV_32FC1,
     )
+    rectified_left_valid = remap_mask(left_valid, map1x, map1y)
+    rectified_right_valid = remap_mask(right_valid, map2x, map2y)
+    rectified_left_phase = remap_float(left_phase, map1x, map1y)
+    rectified_right_phase = remap_float(right_phase, map2x, map2y)
+    rectified_left_phase[~rectified_left_valid] = np.nan
+    rectified_right_phase[~rectified_right_valid] = np.nan
     return {
-        "left_coord": remap_float(left_phase, map1x, map1y),
-        "right_coord": remap_float(right_phase, map2x, map2y),
-        "left_valid": remap_mask(left_valid, map1x, map1y),
-        "right_valid": remap_mask(right_valid, map2x, map2y),
+        "left_coord": rectified_left_phase,
+        "right_coord": rectified_right_phase,
+        "left_valid": rectified_left_valid,
+        "right_valid": rectified_right_valid,
         "Q": Q,
     }
+
+
+def left_rectification_to_world_matrix(rectification: np.ndarray) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.linalg.inv(rectification)
+    return transform
 
 
 def scale_calibration_to_image_size(
@@ -650,145 +963,89 @@ def remap_mask(mask: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.nda
     ).astype(bool)
 
 
-def match_phase_to_disparity(
-    left_coord: np.ndarray,
-    right_coord: np.ndarray,
-    left_valid: np.ndarray,
-    right_valid: np.ndarray,
-) -> np.ndarray:
-    height, width = left_coord.shape
-    disparity = np.full((height, width), np.nan, dtype=np.float32)
-    x_grid = np.arange(width, dtype=np.float32)
+def save_timing_stats(path: Path, timing: dict[str, float]) -> None:
+    point_cloud_ms = float(timing.get("point_cloud_ms", timing.get("reconstruct_ms", 0.0)))
+    lines = [
+        "timing1_capture_to_save_ms=%.3f" % float(timing.get("capture_save_ms", 0.0)),
+        "timing2_phase_decode_ms=%.3f" % float(timing.get("phase_decode_ms", 0.0)),
+        "timing3_point_cloud_ms=%.3f" % point_cloud_ms,
+        "timing4_total_ms=%.3f" % float(timing.get("total_ms", 0.0)),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    for row in range(height):
-        right_mask = right_valid[row] & np.isfinite(right_coord[row])
-        left_mask = left_valid[row] & np.isfinite(left_coord[row])
-        if np.count_nonzero(right_mask) < 2 or np.count_nonzero(left_mask) == 0:
-            continue
 
-        right_phase = right_coord[row, right_mask]
-        right_x = x_grid[right_mask]
-        order = np.argsort(right_phase)
-        sorted_phase = right_phase[order]
-        sorted_x = right_x[order]
-        unique_phase, unique_indices = np.unique(sorted_phase, return_index=True)
-        if unique_phase.size < 2:
-            continue
-        unique_x = sorted_x[unique_indices]
-
-        left_phase = left_coord[row, left_mask]
-        in_range = (left_phase >= unique_phase[0]) & (left_phase <= unique_phase[-1])
-        if not np.any(in_range):
-            continue
-        left_indices = np.flatnonzero(left_mask)[in_range]
-        matched_x = np.interp(left_phase[in_range], unique_phase, unique_x).astype(np.float32)
-        disparity[row, left_indices] = x_grid[left_indices] - matched_x
-
-    return disparity
+def save_phase_npy(
+    base_path: Path,
+    phase: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    masked_phase = phase.astype(np.float32, copy=True)
+    masked_phase[~valid] = np.nan
+    np.save(str(base_path.with_suffix(".npy")), masked_phase)
 
 
 def save_phase(
     base_path: Path,
     phase: np.ndarray,
     valid: np.ndarray,
-    period: Optional[float] = None,
 ) -> None:
     masked_phase = phase.astype(np.float32, copy=True)
     masked_phase[~valid] = np.nan
     np.save(str(base_path.with_suffix(".npy")), masked_phase)
+
     finite = np.isfinite(masked_phase)
-    if period is None:
-        if np.any(finite):
-            lo = float(np.nanpercentile(masked_phase[finite], 1))
-            hi = float(np.nanpercentile(masked_phase[finite], 99))
-        else:
-            lo, hi = 0.0, 1.0
-    else:
-        lo, hi = 0.0, float(period)
-    save_float_image(base_path.with_suffix(".png"), masked_phase, finite, lo=lo, hi=hi)
+    image = np.zeros(masked_phase.shape, dtype=np.uint8)
+    if np.any(finite):
+        lo = float(np.nanpercentile(masked_phase[finite], 1))
+        hi = float(np.nanpercentile(masked_phase[finite], 99))
+        if hi <= lo:
+            hi = lo + 1.0
+        scaled = (masked_phase - lo) * (255.0 / (hi - lo))
+        image[finite] = np.clip(scaled[finite], 0, 255).astype(np.uint8)
 
-
-def save_float_image(
-    path: Path,
-    values: np.ndarray,
-    valid: np.ndarray,
-    lo: Optional[float] = None,
-    hi: Optional[float] = None,
-) -> None:
-    image = normalize_to_uint8(values, valid, lo=lo, hi=hi)
-    ok = cv2.imwrite(str(path), image)
+    ok = cv2.imwrite(str(base_path.with_suffix(".png")), image)
     if not ok:
-        raise RuntimeError("Failed to save image: %s" % path)
+        raise RuntimeError("Failed to save phase image: %s" % base_path.with_suffix(".png"))
 
 
-def normalize_to_uint8(
-    values: np.ndarray,
+def save_wrapped_phase_binary_outputs(
+    base_path: Path,
+    phase: np.ndarray,
     valid: np.ndarray,
-    lo: Optional[float] = None,
-    hi: Optional[float] = None,
-) -> np.ndarray:
-    finite = np.isfinite(values) & valid
-    output = np.zeros(values.shape, dtype=np.uint8)
-    if not np.any(finite):
-        return output
-    if lo is None:
-        lo = float(np.nanpercentile(values[finite], 1))
-    if hi is None:
-        hi = float(np.nanpercentile(values[finite], 99))
-    if hi <= lo:
-        hi = lo + 1.0
-    scaled = (values - lo) * (255.0 / (hi - lo))
-    output[finite] = np.clip(scaled[finite], 0, 255).astype(np.uint8)
-    return output
+) -> None:
+    phase_mod = np.mod(phase, TWO_PI)
+    finite = np.isfinite(phase_mod) & valid
+
+    binary_1 = np.full(phase_mod.shape, np.nan, dtype=np.float32)
+    mask_1 = finite & (phase_mod >= (np.pi / 4.0)) & (phase_mod <= (7.0 * np.pi / 4.0))
+    binary_1[finite] = 0.0
+    binary_1[mask_1] = 255.0
+    save_binary_phase(base_path.with_name(base_path.name + "_binary_1"), binary_1, finite)
+
+    binary_2 = np.full(phase_mod.shape, np.nan, dtype=np.float32)
+    mask_2 = finite & (
+        ((phase_mod > 0.0) & (phase_mod <= (3.0 * np.pi / 4.0)))
+        | ((phase_mod >= (5.0 * np.pi / 4.0)) & (phase_mod <= TWO_PI))
+    )
+    binary_2[finite] = 0.0
+    binary_2[mask_2] = 255.0
+    save_binary_phase(base_path.with_name(base_path.name + "_binary_2"), binary_2, finite)
+
+
+def save_binary_phase(
+    base_path: Path,
+    binary: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    np.save(str(base_path.with_suffix(".npy")), binary.astype(np.float32))
+    image = np.zeros(binary.shape, dtype=np.uint8)
+    finite = np.isfinite(binary) & valid
+    image[finite] = np.clip(binary[finite], 0, 255).astype(np.uint8)
+    ok = cv2.imwrite(str(base_path.with_suffix(".png")), image)
+    if not ok:
+        raise RuntimeError("Failed to save binary phase image: %s" % base_path.with_suffix(".png"))
 
 
 def save_point_cloud_txt(path: Path, points: np.ndarray, valid: np.ndarray) -> None:
     flat_points = points[valid].astype(np.float32)
     np.savetxt(str(path), flat_points, fmt="%.8f %.8f %.8f")
-
-
-def save_ply(
-    path: Path,
-    points: np.ndarray,
-    valid: np.ndarray,
-    colors: Optional[np.ndarray] = None,
-) -> None:
-    flat_points = points[valid].astype(np.float32)
-    if colors is None:
-        flat_colors = np.full(flat_points.shape[0], 255, dtype=np.uint8)
-    else:
-        flat_colors = colors[valid].astype(np.uint8)
-
-    vertex = np.empty(
-        flat_points.shape[0],
-        dtype=[
-            ("x", "<f4"),
-            ("y", "<f4"),
-            ("z", "<f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-        ],
-    )
-    vertex["x"] = flat_points[:, 0]
-    vertex["y"] = flat_points[:, 1]
-    vertex["z"] = flat_points[:, 2]
-    vertex["red"] = flat_colors
-    vertex["green"] = flat_colors
-    vertex["blue"] = flat_colors
-
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        "element vertex %d\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        "end_header\n"
-    ) % vertex.shape[0]
-    with path.open("wb") as file:
-        file.write(header.encode("ascii"))
-        vertex.tofile(file)

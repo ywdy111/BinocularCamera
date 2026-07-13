@@ -27,7 +27,7 @@ BURNED_PATTERN_COUNT: int = 18
 PROJECTOR_FPS: float = 6.0
 
 # 每张图案重复播放的帧数，对应 MA 命令的 repeat_frames。
-REPEAT_FRAMES: int = 2
+REPEAT_FRAMES: int = 1
 
 # 触发起始帧，只能为 0 或 1。
 TRIGGER_START_FRAME: int = 0
