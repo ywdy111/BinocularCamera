@@ -30,6 +30,7 @@ TWO_PI = 2.0 * np.pi
 POINT_CLOUD_Z_MIN_MM = 300.0
 POINT_CLOUD_Z_MAX_MM = 500.0
 POINT_CLOUD_MIN_COMPONENT_PIXELS = 64
+RIGHT_ROI_MARGIN_PIXELS = 32
 MIN_PHASE_MODULATION = 8.0
 MIN_PHASE_INTENSITY_SWING = 16.0
 PHASE_MODULATION_RELATIVE_THRESHOLD = 0.15
@@ -65,9 +66,52 @@ def reconstruct_capture(
     capture_dir: Union[Path, str],
     stripe_index: int,
     calib_path: Union[Path, str] = DEFAULT_CALIB_PATH,
+    left_roi: Optional[tuple[int, int, int, int]] = None,
 ) -> tuple[Path, dict[str, float]]:
     config = STRIPE_CONFIGS[int(stripe_index)]
     capture_path = Path(capture_dir)
+    left_images = load_capture_images(capture_path / LEFT_DIR_NAME)
+    right_images = load_capture_images(capture_path / RIGHT_DIR_NAME)
+    return reconstruct_images(
+        capture_path,
+        config,
+        left_images,
+        right_images,
+        Path(calib_path),
+        left_roi,
+    )
+
+
+def reconstruct_frames(
+    capture_dir: Union[Path, str],
+    stripe_index: int,
+    left_frames: Sequence[tuple[object, object]],
+    right_frames: Sequence[tuple[object, object]],
+    calib_path: Union[Path, str] = DEFAULT_CALIB_PATH,
+    left_roi: Optional[tuple[int, int, int, int]] = None,
+) -> tuple[Path, dict[str, float]]:
+    config = STRIPE_CONFIGS[int(stripe_index)]
+    capture_path = Path(capture_dir)
+    left_images = frame_sequence_to_images(left_frames)
+    right_images = frame_sequence_to_images(right_frames)
+    return reconstruct_images(
+        capture_path,
+        config,
+        left_images,
+        right_images,
+        Path(calib_path),
+        left_roi,
+    )
+
+
+def reconstruct_images(
+    capture_path: Path,
+    config: StripeConfig,
+    left_images: Sequence[np.ndarray],
+    right_images: Sequence[np.ndarray],
+    calib_path: Path,
+    left_roi: Optional[tuple[int, int, int, int]] = None,
+) -> tuple[Path, dict[str, float]]:
     output_dir = capture_path / "rebuild"
     output_dir.mkdir(parents=True, exist_ok=True)
     cleanup_rebuild_outputs(output_dir)
@@ -75,13 +119,20 @@ def reconstruct_capture(
     timing: dict[str, float] = {}
 
     decode_start = time.monotonic()
-    left_images = load_capture_images(capture_path / LEFT_DIR_NAME)
-    right_images = load_capture_images(capture_path / RIGHT_DIR_NAME)
+    image_shape = left_images[0].shape[:2]
+    left_roi = normalize_roi(left_roi, image_shape)
+    right_roi = None
+    if left_roi is not None:
+        right_roi = right_roi_from_left_roi(calib_path, left_roi, (image_shape[1], image_shape[0]))
+        if right_roi is None:
+            right_roi = (0, 0, image_shape[1], image_shape[0])
+        save_roi_info(output_dir / "roi.txt", left_roi, right_roi)
+
     white_left, pattern_left = split_white_and_patterns(left_images, expected_pattern_count(config))
     white_right, pattern_right = split_white_and_patterns(right_images, expected_pattern_count(config))
 
-    left_result = decode_patterns(pattern_left, config, white_left, output_dir / "left")
-    right_result = decode_patterns(pattern_right, config, white_right, output_dir / "right")
+    left_result = decode_patterns(pattern_left, config, white_left, output_dir / "left", left_roi)
+    right_result = decode_patterns(pattern_right, config, white_right, output_dir / "right", right_roi)
     timing["phase_decode_ms"] = (time.monotonic() - decode_start) * 1000.0
 
     if config.do_reconstruct:
@@ -89,6 +140,12 @@ def reconstruct_capture(
         timing.update(build_point_cloud(
             calib_path=Path(calib_path),
             output_dir=output_dir,
+            left_phase=left_result["unwrapped"],
+            right_phase=right_result["unwrapped"],
+            left_valid=left_result["valid"],
+            right_valid=right_result["valid"],
+            left_roi=left_roi,
+            right_roi=right_roi,
         ))
         timing["reconstruct_ms"] = (time.monotonic() - reconstruct_start) * 1000.0
     else:
@@ -97,6 +154,13 @@ def reconstruct_capture(
         timing["point_cloud_ms"] = 0.0
 
     return output_dir, timing
+
+
+def frame_sequence_to_images(frames: Sequence[tuple[object, object]]) -> list[np.ndarray]:
+    images: list[np.ndarray] = []
+    for image, _info in frames:
+        images.append(np.asarray(image).astype(np.float32))
+    return images
 
 
 def expected_pattern_count(config: StripeConfig) -> int:
@@ -115,15 +179,178 @@ def wrapped_only_steps(config: StripeConfig) -> tuple[int, ...]:
     return tuple([config.phase_steps] * len(config.cycles))
 
 
+def normalize_roi(
+    roi: Optional[tuple[int, int, int, int]],
+    image_shape: tuple[int, int],
+) -> Optional[tuple[int, int, int, int]]:
+    if roi is None:
+        return None
+    height, width = image_shape
+    x, y, w, h = [int(value) for value in roi]
+    x = max(0, min(width - 1, x))
+    y = max(0, min(height - 1, y))
+    w = max(1, min(width - x, w))
+    h = max(1, min(height - y, h))
+    return x, y, w, h
+
+
+def crop_array(
+    values: np.ndarray,
+    roi: Optional[tuple[int, int, int, int]],
+) -> np.ndarray:
+    if roi is None:
+        return values
+    x, y, w, h = roi
+    return values[y : y + h, x : x + w]
+
+
+def roi_mask(
+    shape: tuple[int, int],
+    roi: Optional[tuple[int, int, int, int]],
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    if roi is None:
+        mask[:, :] = True
+        return mask
+    x, y, w, h = roi
+    mask[y : y + h, x : x + w] = True
+    return mask
+
+
+def bounding_roi_from_mask(mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+    rows, cols = np.nonzero(mask)
+    if rows.size == 0 or cols.size == 0:
+        return None
+    x0 = int(cols.min())
+    y0 = int(rows.min())
+    x1 = int(cols.max()) + 1
+    y1 = int(rows.max()) + 1
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def save_roi_info(
+    path: Path,
+    left_roi: tuple[int, int, int, int],
+    right_roi: Optional[tuple[int, int, int, int]],
+) -> None:
+    lines = [
+        "left_roi x=%d y=%d width=%d height=%d" % left_roi,
+    ]
+    if right_roi is not None:
+        lines.append("right_roi x=%d y=%d width=%d height=%d" % right_roi)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def right_roi_from_left_roi(
+    calib_path: Path,
+    left_roi: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+) -> Optional[tuple[int, int, int, int]]:
+    try:
+        calib = scale_calibration_to_image_size(load_calibration(calib_path), image_size)
+        R1, R2, P1, P2, Q, _roi1, _roi2 = cv2.stereoRectify(
+            calib["K1"],
+            calib["dist1"],
+            calib["K2"],
+            calib["dist2"],
+            image_size,
+            calib["R"],
+            calib["T"],
+            flags=0,
+            alpha=-1,
+            newImageSize=image_size,
+        )
+        left_map_x, left_map_y = cv2.initUndistortRectifyMap(
+            calib["K1"], calib["dist1"], R1, P1, image_size, cv2.CV_32FC1
+        )
+        right_map_x, right_map_y = cv2.initUndistortRectifyMap(
+            calib["K2"], calib["dist2"], R2, P2, image_size, cv2.CV_32FC1
+        )
+        x, y, w, h = left_roi
+        left_rectified_mask = (
+            (left_map_x >= x)
+            & (left_map_x < x + w)
+            & (left_map_y >= y)
+            & (left_map_y < y + h)
+        )
+        left_rectified_roi = bounding_roi_from_mask(left_rectified_mask)
+        if left_rectified_roi is None:
+            return None
+
+        disparity_min, disparity_max = disparity_range_from_q(
+            Q,
+            POINT_CLOUD_Z_MIN_MM,
+            POINT_CLOUD_Z_MAX_MM,
+            image_size[0],
+        )
+        image_width, image_height = image_size
+        lx, ly, lw, lh = left_rectified_roi
+        right_x0 = int(np.floor(lx - disparity_max - RIGHT_ROI_MARGIN_PIXELS))
+        right_x1 = int(np.ceil(lx + lw - disparity_min + RIGHT_ROI_MARGIN_PIXELS))
+        right_y0 = int(np.floor(ly - RIGHT_ROI_MARGIN_PIXELS))
+        right_y1 = int(np.ceil(ly + lh + RIGHT_ROI_MARGIN_PIXELS))
+        right_x0 = max(0, min(image_width - 1, right_x0))
+        right_y0 = max(0, min(image_height - 1, right_y0))
+        right_x1 = max(right_x0 + 1, min(image_width, right_x1))
+        right_y1 = max(right_y0 + 1, min(image_height, right_y1))
+
+        right_rectified_mask = np.zeros((image_height, image_width), dtype=bool)
+        right_rectified_mask[right_y0:right_y1, right_x0:right_x1] = True
+        right_rectified_mask &= np.isfinite(right_map_x) & np.isfinite(right_map_y)
+        if not np.any(right_rectified_mask):
+            return None
+        rx = right_map_x[right_rectified_mask]
+        ry = right_map_y[right_rectified_mask]
+        x0 = max(0, int(np.floor(np.nanmin(rx))))
+        y0 = max(0, int(np.floor(np.nanmin(ry))))
+        x1 = min(image_width, int(np.ceil(np.nanmax(rx))) + 1)
+        y1 = min(image_height, int(np.ceil(np.nanmax(ry))) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1 - x0, y1 - y0
+    except Exception:
+        return None
+
+
+def disparity_range_from_q(
+    Q: np.ndarray,
+    z_min: float,
+    z_max: float,
+    image_width: int,
+) -> tuple[float, float]:
+    q23 = float(Q[2, 3])
+    q32 = float(Q[3, 2])
+    q33 = float(Q[3, 3])
+    candidates: list[float] = []
+    for z in (float(z_min), float(z_max)):
+        if z <= 0.0 or abs(q32) <= 1e-12:
+            continue
+        disparity = (q23 / z - q33) / q32
+        if np.isfinite(disparity):
+            candidates.append(disparity)
+    if not candidates:
+        return -float(image_width), float(image_width)
+
+    lo = min(candidates)
+    hi = max(candidates)
+    lo = max(-float(image_width), min(float(image_width), lo))
+    hi = max(-float(image_width), min(float(image_width), hi))
+    return lo, hi
+
+
 def cleanup_rebuild_outputs(output_dir: Path) -> None:
     patterns = [
+        "disparity.npy",
         "disparity.png",
+        "point_cloud.txt",
         "point_cloud.ply",
         "point_cloud_points.npy",
         "point_cloud_filter_stats.txt",
         "rectified_phase_pair.png",
         "rectified_valid_mask.png",
         "rectified_valid_stats.txt",
+        "roi.txt",
+        "timing_stats.txt",
     ]
     side_patterns = [
         "wrapped_phase_*.npy",
@@ -192,14 +419,15 @@ def decode_patterns(
     config: StripeConfig,
     white_image: np.ndarray,
     output_dir: Path,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, np.ndarray]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if config.mode == "multi_frequency":
-        return decode_multi_frequency(images, config, white_image, output_dir)
+        return decode_multi_frequency(images, config, white_image, output_dir, roi)
     if config.mode == "gray_code":
-        return decode_gray_code(images, config, white_image, output_dir)
+        return decode_gray_code(images, config, white_image, output_dir, roi)
     if config.mode == "wrapped_only":
-        return decode_wrapped_only(images, config, white_image, output_dir)
+        return decode_wrapped_only(images, config, white_image, output_dir, roi)
     raise ValueError("Unsupported stripe mode: %s" % config.mode)
 
 
@@ -208,6 +436,7 @@ def decode_multi_frequency(
     config: StripeConfig,
     white_image: np.ndarray,
     output_dir: Path,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, np.ndarray]:
     groups = [
         images[index * config.phase_steps : (index + 1) * config.phase_steps]
@@ -221,9 +450,10 @@ def decode_multi_frequency(
     for cycles, (wrapped, modulation, valid) in zip(config.cycles, results):
         wrapped_maps.append(wrapped)
         valid_maps.append(valid)
-        save_phase_npy(output_dir / ("wrapped_phase_f%d" % cycles), wrapped, valid)
+        save_phase_npy(output_dir / ("wrapped_phase_f%d" % cycles), wrapped, valid, roi)
 
     valid = np.logical_and.reduce(valid_maps)
+    valid = valid & roi_mask(valid.shape, roi)
     projector_coord = unwrap_multi_frequency(
         wrapped_maps,
         config.cycles,
@@ -231,7 +461,7 @@ def decode_multi_frequency(
         config.projector_width,
     )
     unwrapped_phase = (projector_coord / float(config.cycles[0])) * TWO_PI
-    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
+    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid, roi)
     return {
         "wrapped": wrapped_maps[0],
         "unwrapped": unwrapped_phase,
@@ -245,6 +475,7 @@ def decode_three_step_frequency(
     config: StripeConfig,
     white_image: np.ndarray,
     output_dir: Path,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, np.ndarray]:
     groups = [
         images[index * config.phase_steps : (index + 1) * config.phase_steps]
@@ -258,9 +489,10 @@ def decode_three_step_frequency(
     for period, (wrapped, modulation, valid) in zip(config.cycles, results):
         wrapped_maps.append(wrapped)
         valid_maps.append(valid)
-        save_phase_npy(output_dir / ("wrapped_phase_f%d" % period), wrapped, valid)
+        save_phase_npy(output_dir / ("wrapped_phase_f%d" % period), wrapped, valid, roi)
 
     valid = np.logical_and.reduce(valid_maps)
+    valid = valid & roi_mask(valid.shape, roi)
     projector_coord = unwrap_multi_frequency(
         wrapped_maps,
         config.cycles,
@@ -268,7 +500,7 @@ def decode_three_step_frequency(
         config.projector_width,
     )
     unwrapped_phase = (projector_coord / float(config.cycles[0])) * TWO_PI
-    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
+    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid, roi)
     return {
         "wrapped": wrapped_maps[0],
         "unwrapped": unwrapped_phase,
@@ -282,6 +514,7 @@ def decode_gray_code(
     config: StripeConfig,
     white_image: np.ndarray,
     output_dir: Path,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, np.ndarray]:
     phase_images = images[:4]
     gray_images = images[4:8]
@@ -312,13 +545,14 @@ def decode_gray_code(
         & (unwrapped_phase < float(period_count) * TWO_PI)
     )
     valid = phase_valid & gray_valid
+    valid = valid & roi_mask(valid.shape, roi)
 
     projector_coord = (unwrapped_phase / TWO_PI) * phase_period
     projector_coord[~valid] = np.nan
     unwrapped_phase[~valid] = np.nan
 
-    save_phase_npy(output_dir / "wrapped_phase_f16", wrapped, phase_valid)
-    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid)
+    save_phase_npy(output_dir / "wrapped_phase_f16", wrapped, phase_valid, roi)
+    save_phase(output_dir / "unwrapped_phase", unwrapped_phase, valid, roi)
     return {
         "wrapped": wrapped,
         "unwrapped": unwrapped_phase,
@@ -332,6 +566,7 @@ def decode_wrapped_only(
     config: StripeConfig,
     white_image: np.ndarray,
     output_dir: Path,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, np.ndarray]:
     first_result: Optional[dict[str, np.ndarray]] = None
     duplicate_cycles = len(set(config.cycles)) != len(config.cycles)
@@ -343,14 +578,15 @@ def decode_wrapped_only(
             raise RuntimeError("Need %d frames for wrapped phase P%d, got %d" % (steps, cycles, len(group)))
         wrapped, modulation, valid = phase_shift(group, white_image)
         base_name = "wrapped_phase_f%d_step%d" % (cycles, steps) if duplicate_cycles else "wrapped_phase_f%d" % cycles
-        save_phase(output_dir / base_name, wrapped, valid)
-        save_phase_npy(output_dir / base_name, wrapped, valid)
+        save_phase(output_dir / base_name, wrapped, valid, roi)
         save_wrapped_phase_binary_outputs(
             output_dir / base_name,
             wrapped,
             valid,
+            roi,
         )
         if first_result is None:
+            valid = valid & roi_mask(valid.shape, roi)
             projector_coord = (wrapped / TWO_PI) * float(cycles)
             projector_coord[~valid] = np.nan
             first_result = {
@@ -722,11 +958,24 @@ def calculate_xyz_parallel(
 def build_point_cloud(
     calib_path: Path,
     output_dir: Path,
+    left_phase: Optional[np.ndarray] = None,
+    right_phase: Optional[np.ndarray] = None,
+    left_valid: Optional[np.ndarray] = None,
+    right_valid: Optional[np.ndarray] = None,
+    left_roi: Optional[tuple[int, int, int, int]] = None,
+    right_roi: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, float]:
     timing: dict[str, float] = {}
     phase_to_abs_start = time.monotonic()
-    left_phase, left_valid = load_unwrapped_phase_npy(output_dir / "left" / "unwrapped_phase.npy")
-    right_phase, right_valid = load_unwrapped_phase_npy(output_dir / "right" / "unwrapped_phase.npy")
+    if left_phase is None or right_phase is None or left_valid is None or right_valid is None:
+        left_phase, left_valid = load_unwrapped_phase_npy(output_dir / "left" / "unwrapped_phase.npy")
+        right_phase, right_valid = load_unwrapped_phase_npy(output_dir / "right" / "unwrapped_phase.npy")
+    else:
+        left_phase = left_phase.astype(np.float32, copy=False)
+        right_phase = right_phase.astype(np.float32, copy=False)
+        left_valid = left_valid.astype(bool, copy=False)
+        right_valid = right_valid.astype(bool, copy=False)
+
     if left_phase.shape != right_phase.shape:
         raise RuntimeError(
             "Left/right unwrapped phase sizes differ: %s vs %s"
@@ -735,6 +984,11 @@ def build_point_cloud(
 
     calib = load_calibration(calib_path)
     height, width = left_phase.shape
+    left_roi = normalize_roi(left_roi, (height, width))
+    right_roi = normalize_roi(right_roi, (height, width))
+    left_valid = left_valid & roi_mask((height, width), left_roi)
+    if right_roi is not None:
+        right_valid = right_valid & roi_mask((height, width), right_roi)
     rectified = rectify_phase_pair(
         left_phase,
         right_phase,
@@ -752,7 +1006,6 @@ def build_point_cloud(
         rectified["left_valid"],
         rectified["right_valid"],
     )
-    np.save(str(output_dir / "disparity.npy"), disparity.astype(np.float32))
     points, base_valid = calculate_xyz_parallel(
         disparity.astype(np.float32),
         rectified["Q"].astype(np.float64),
@@ -760,6 +1013,8 @@ def build_point_cloud(
         np.float32(POINT_CLOUD_Z_MAX_MM),
     )
     valid = filter_point_cloud_valid_mask(points, base_valid)
+    disparity_roi = bounding_roi_from_mask(np.isfinite(disparity) & rectified["left_valid"])
+    np.save(str(output_dir / "disparity.npy"), crop_array(disparity.astype(np.float32), disparity_roi))
     save_point_cloud_txt(output_dir / "point_cloud.txt", points, valid)
     timing["point_cloud_ms"] = (time.monotonic() - reconstruct_start) * 1000.0
     return timing
@@ -978,9 +1233,11 @@ def save_phase_npy(
     base_path: Path,
     phase: np.ndarray,
     valid: np.ndarray,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     masked_phase = phase.astype(np.float32, copy=True)
     masked_phase[~valid] = np.nan
+    masked_phase = crop_array(masked_phase, roi)
     np.save(str(base_path.with_suffix(".npy")), masked_phase)
 
 
@@ -988,9 +1245,11 @@ def save_phase(
     base_path: Path,
     phase: np.ndarray,
     valid: np.ndarray,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     masked_phase = phase.astype(np.float32, copy=True)
     masked_phase[~valid] = np.nan
+    masked_phase = crop_array(masked_phase, roi)
     np.save(str(base_path.with_suffix(".npy")), masked_phase)
 
     finite = np.isfinite(masked_phase)
@@ -1012,6 +1271,7 @@ def save_wrapped_phase_binary_outputs(
     base_path: Path,
     phase: np.ndarray,
     valid: np.ndarray,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     phase_mod = np.mod(phase, TWO_PI)
     finite = np.isfinite(phase_mod) & valid
@@ -1020,23 +1280,26 @@ def save_wrapped_phase_binary_outputs(
     mask_1 = finite & (phase_mod >= (np.pi / 4.0)) & (phase_mod <= (7.0 * np.pi / 4.0))
     binary_1[finite] = 0.0
     binary_1[mask_1] = 255.0
-    save_binary_phase(base_path.with_name(base_path.name + "_binary_1"), binary_1, finite)
+    save_binary_phase(base_path.with_name(base_path.name + "_binary_1"), binary_1, finite, roi)
 
     binary_2 = np.full(phase_mod.shape, np.nan, dtype=np.float32)
     mask_2 = finite & (
-        ((phase_mod > 0.0) & (phase_mod <= (3.0 * np.pi / 4.0)))
+        ((phase_mod >= 0.0) & (phase_mod <= (3.0 * np.pi / 4.0)))
         | ((phase_mod >= (5.0 * np.pi / 4.0)) & (phase_mod <= TWO_PI))
     )
     binary_2[finite] = 0.0
     binary_2[mask_2] = 255.0
-    save_binary_phase(base_path.with_name(base_path.name + "_binary_2"), binary_2, finite)
+    save_binary_phase(base_path.with_name(base_path.name + "_binary_2"), binary_2, finite, roi)
 
 
 def save_binary_phase(
     base_path: Path,
     binary: np.ndarray,
     valid: np.ndarray,
+    roi: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
+    binary = crop_array(binary, roi)
+    valid = crop_array(valid, roi)
     np.save(str(base_path.with_suffix(".npy")), binary.astype(np.float32))
     image = np.zeros(binary.shape, dtype=np.uint8)
     finite = np.isfinite(binary) & valid

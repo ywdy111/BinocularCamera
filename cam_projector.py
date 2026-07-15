@@ -176,7 +176,7 @@ def set_projector_brightness(projector: Projector) -> None:
 
 
 # ============================== 图像保存 ==============================
-def create_next_capture_dirs() -> tuple[Path, Path, Path]:
+def create_next_capture_dirs(create_picture_dirs: bool = True) -> tuple[Path, Path, Path]:
     """Create data/<next_number>/Left_picture and Right_picture directories."""
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -189,8 +189,10 @@ def create_next_capture_dirs() -> tuple[Path, Path, Path]:
     capture_dir = DATA_DIR / str(next_number)
     left_save_dir = capture_dir / LEFT_PICTURE_DIR_NAME
     right_save_dir = capture_dir / RIGHT_PICTURE_DIR_NAME
-    left_save_dir.mkdir(parents=True, exist_ok=False)
-    right_save_dir.mkdir(parents=True, exist_ok=False)
+    capture_dir.mkdir(parents=True, exist_ok=False)
+    if create_picture_dirs:
+        left_save_dir.mkdir(parents=True, exist_ok=False)
+        right_save_dir.mkdir(parents=True, exist_ok=False)
     return capture_dir, left_save_dir, right_save_dir
 
 

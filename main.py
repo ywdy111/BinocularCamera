@@ -30,10 +30,10 @@ CALIB_DIR = PROJECT_ROOT / "config" / "data_calib"
 DEFAULT_CALIB_FILE = CALIB_DIR / "calib.txt"
 CALIB_PATH_CONFIG = CALIB_DIR / "calib_path.json"
 
-DEFAULT_EXPOSURE_US = 8000
+DEFAULT_EXPOSURE_US = 6000
 DEFAULT_GAIN = 0
-DEFAULT_PROJECTOR_EXPOSURE_US = 8000
-DEFAULT_PROJECTOR_BRIGHTNESS = 35
+DEFAULT_PROJECTOR_EXPOSURE_US = 6000
+DEFAULT_PROJECTOR_BRIGHTNESS = 30
 PROJECTOR_WARMUP_START_FRAME = 0
 PROJECTOR_WARMUP_PATTERN_COUNT = 12
 PREVIEW_TIMEOUT_MS = 50
@@ -91,6 +91,7 @@ class ScanWorker(QtCore.QThread):
         projector_exposure_us: int,
         stripe_index: int,
         calib_path: Path,
+        left_roi: Optional[tuple[int, int, int, int]] = None,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -102,10 +103,14 @@ class ScanWorker(QtCore.QThread):
         self.projector_exposure_us = projector_exposure_us
         self.stripe_index = stripe_index
         self.calib_path = calib_path
+        self.left_roi = left_roi
 
     def run(self) -> None:
         try:
-            capture_dir, left_save_dir, right_save_dir = cam_projector.create_next_capture_dirs()
+            save_raw_frames = self.stripe_index != 5
+            capture_dir, left_save_dir, right_save_dir = cam_projector.create_next_capture_dirs(
+                create_picture_dirs=save_raw_frames
+            )
             self._prepare_scan_cameras()
             cam_projector.set_projector_brightness(self.projector)
             set_projector_exposure_us(self.projector, self.projector_exposure_us)
@@ -134,12 +139,13 @@ class ScanWorker(QtCore.QThread):
 
             cam_projector.stop_camera_grabbing(self.left_camera)
             cam_projector.stop_camera_grabbing(self.right_camera)
-            cam_projector.save_stereo_frames(
-                left_frames,
-                right_frames,
-                left_save_dir,
-                right_save_dir,
-            )
+            if save_raw_frames:
+                cam_projector.save_stereo_frames(
+                    left_frames,
+                    right_frames,
+                    left_save_dir,
+                    right_save_dir,
+                )
             capture_save_ms = (time.monotonic() - projection_start) * 1000.0
 
             remaining_wait_s = cam_projector.PROJECTION_WAIT_S - (
@@ -153,11 +159,22 @@ class ScanWorker(QtCore.QThread):
             except Exception:
                 pass
 
-            rebuild_dir, timing = structured_light_rebuild.reconstruct_capture(
-                capture_dir,
-                self.stripe_index,
-                calib_path=self.calib_path,
-            )
+            if save_raw_frames:
+                rebuild_dir, timing = structured_light_rebuild.reconstruct_capture(
+                    capture_dir,
+                    self.stripe_index,
+                    calib_path=self.calib_path,
+                    left_roi=self.left_roi,
+                )
+            else:
+                rebuild_dir, timing = structured_light_rebuild.reconstruct_frames(
+                    capture_dir,
+                    self.stripe_index,
+                    left_frames,
+                    right_frames,
+                    calib_path=self.calib_path,
+                    left_roi=self.left_roi,
+                )
 
             total_ms = (time.monotonic() - projection_start) * 1000.0
             timing.update(
@@ -221,6 +238,10 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.Left_show: None,
             self.Right_show: None,
         }
+        self.roi_selecting = False
+        self.roi_drag_start: Optional[QtCore.QPoint] = None
+        self.roi_drag_end: Optional[QtCore.QPoint] = None
+        self.left_roi: Optional[tuple[int, int, int, int]] = None
 
         self.preview_timer = QtCore.QTimer(self)
         self.preview_timer.setInterval(PREVIEW_INTERVAL_MS)
@@ -245,6 +266,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.exchange_camera.setText("调转相机")
         self.Scan_rebuild.setText("扫描重建")
         self.photo.setText("单帧拍照")
+        self.shoot.setText("左截图")
         self.Calibration.setText("双目标定")
         self.open_calib.setText("选择标定文件")
         self.open_folder_1.setText("打开左条纹目录")
@@ -276,7 +298,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.change_gain.setRange(0, 48)
         self.change_gain.setSingleStep(1)
         self.change_gain.setValue(DEFAULT_GAIN)
-        self.change_gain.setMinimumWidth(70)
+        self.change_gain.setMinimumWidth(50)
 
         self.Change_brightness.setRange(10, 200)
         self.Change_brightness.setSingleStep(5)
@@ -302,6 +324,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.exchange_camera.clicked.connect(self.exchange_cameras)
         self.Scan_rebuild.clicked.connect(self.scan_rebuild)
         self.photo.clicked.connect(self.capture_photo)
+        self.shoot.clicked.connect(self.enable_roi_selection)
         self.Calibration.clicked.connect(self.run_stereo_calibration)
         self.open_calib.clicked.connect(self.select_calibration_file)
         self.open_folder_1.clicked.connect(self.open_left_stripe_folder)
@@ -309,6 +332,24 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.open_folder.clicked.connect(self.open_capture_folder)
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self.Left_show and self.roi_selecting:
+            if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
+                if self.last_left_frame is None:
+                    return True
+                self.roi_drag_start = event.pos()
+                self.roi_drag_end = event.pos()
+                self.refresh_last_frames()
+                return True
+            if event.type() == QtCore.QEvent.MouseMove and self.roi_drag_start is not None:
+                self.roi_drag_end = event.pos()
+                self.refresh_last_frames()
+                return True
+            if event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton:
+                if self.roi_drag_start is not None:
+                    self.roi_drag_end = event.pos()
+                    self.finish_roi_selection()
+                return True
+
         if watched in self.zoom and event.type() == QtCore.QEvent.Wheel:
             image = self.current_frame_for_label(watched)
             if image is None:
@@ -588,6 +629,7 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             DEFAULT_PROJECTOR_EXPOSURE_US,
             self.Change_stripe.currentIndex(),
             self.current_calibration_path(),
+            self.left_roi,
             self,
         )
         self.scan_worker.finished_ok.connect(self.scan_finished)
@@ -957,6 +999,12 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             painter = QtGui.QPainter(canvas)
             painter.drawPixmap(x, y, scaled)
+            if label is self.Left_show:
+                roi_rect = self.current_left_roi_label_rect()
+                if roi_rect is not None and roi_rect.width() > 1 and roi_rect.height() > 1:
+                    pen = QtGui.QPen(QtGui.QColor(255, 0, 0), 2)
+                    painter.setPen(pen)
+                    painter.drawRect(roi_rect)
             if self.Crosshair.isChecked():
                 pen = QtGui.QPen(QtGui.QColor(255, 0, 0), 1)
                 painter.setPen(pen)
@@ -967,6 +1015,90 @@ class MyMainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             painter.end()
 
         label.setPixmap(canvas)
+
+    def enable_roi_selection(self) -> None:
+        if self.last_left_frame is None:
+            QtWidgets.QMessageBox.warning(self, "无左图", "请先打开设备并显示左相机图像。")
+            return
+        self.roi_selecting = True
+        self.roi_drag_start = None
+        self.roi_drag_end = None
+        self.statusbar.showMessage("请在左图中拖动鼠标选择重建区域。", 3000)
+
+    def finish_roi_selection(self) -> None:
+        roi = self.drag_label_rect_to_image_roi()
+        self.roi_selecting = False
+        self.roi_drag_start = None
+        self.roi_drag_end = None
+        if roi is None:
+            self.statusbar.showMessage("截图区域无效。", 3000)
+            self.refresh_last_frames()
+            return
+        self.left_roi = roi
+        x, y, w, h = roi
+        self.statusbar.showMessage("重建区域: x=%d, y=%d, w=%d, h=%d" % (x, y, w, h), 5000)
+        self.refresh_last_frames()
+
+    def current_left_roi_label_rect(self) -> Optional[QtCore.QRect]:
+        if self.roi_selecting and self.roi_drag_start is not None and self.roi_drag_end is not None:
+            return QtCore.QRect(self.roi_drag_start, self.roi_drag_end).normalized()
+        if self.left_roi is None or self.last_left_frame is None:
+            return None
+        return self.image_roi_to_label_rect(self.Left_show, self.last_left_frame, self.left_roi)
+
+    def drag_label_rect_to_image_roi(self) -> Optional[tuple[int, int, int, int]]:
+        if self.last_left_frame is None or self.roi_drag_start is None or self.roi_drag_end is None:
+            return None
+        p1 = self.label_pos_to_image_point(self.Left_show, self.last_left_frame, self.roi_drag_start)
+        p2 = self.label_pos_to_image_point(self.Left_show, self.last_left_frame, self.roi_drag_end)
+        if p1 is None or p2 is None:
+            return None
+        height, width = self.last_left_frame.shape[:2]
+        x0 = max(0, min(p1.x(), p2.x()))
+        y0 = max(0, min(p1.y(), p2.y()))
+        x1 = min(width, max(p1.x(), p2.x()) + 1)
+        y1 = min(height, max(p1.y(), p2.y()) + 1)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return int(x0), int(y0), int(x1 - x0), int(y1 - y0)
+
+    def label_pos_to_image_point(
+        self,
+        label: QtWidgets.QLabel,
+        image,
+        pos: QtCore.QPoint,
+    ) -> Optional[QtCore.QPoint]:
+        height, width = image.shape[:2]
+        image_size = self.scaled_image_size(label, image, self.zoom[label])
+        top_left = self.image_top_left[label]
+        if top_left is None:
+            top_left = self.default_top_left(label, image_size)
+        x = (float(pos.x()) - top_left.x()) * width / float(image_size.width())
+        y = (float(pos.y()) - top_left.y()) * height / float(image_size.height())
+        if x < 0 or y < 0 or x >= width or y >= height:
+            return None
+        return QtCore.QPoint(int(x), int(y))
+
+    def image_roi_to_label_rect(
+        self,
+        label: QtWidgets.QLabel,
+        image,
+        roi: tuple[int, int, int, int],
+    ) -> QtCore.QRect:
+        height, width = image.shape[:2]
+        image_size = self.scaled_image_size(label, image, self.zoom[label])
+        top_left = self.image_top_left[label]
+        if top_left is None:
+            top_left = self.default_top_left(label, image_size)
+        x, y, w, h = roi
+        sx = image_size.width() / float(width)
+        sy = image_size.height() / float(height)
+        return QtCore.QRect(
+            int(top_left.x() + x * sx),
+            int(top_left.y() + y * sy),
+            max(1, int(w * sx)),
+            max(1, int(h * sy)),
+        )
 
     def refresh_last_frames(self) -> None:
         if self.last_left_frame is not None:

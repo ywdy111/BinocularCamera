@@ -462,7 +462,7 @@
       <rect>
        <x>0</x>
        <y>0</y>
-       <width>831</width>
+       <width>838</width>
        <height>51</height>
       </rect>
      </property>
@@ -540,7 +540,7 @@
        <widget class="QSpinBox" name="change_exposure">
         <property name="minimumSize">
          <size>
-          <width>60</width>
+          <width>50</width>
           <height>0</height>
          </size>
         </property>
@@ -595,7 +595,7 @@
        <widget class="QSpinBox" name="change_gain">
         <property name="minimumSize">
          <size>
-          <width>60</width>
+          <width>50</width>
           <height>0</height>
          </size>
         </property>
@@ -610,6 +610,27 @@
           <family>Times New Roman</family>
           <pointsize>14</pointsize>
          </font>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="shoot">
+        <property name="minimumSize">
+         <size>
+          <width>65</width>
+          <height>30</height>
+         </size>
+        </property>
+        <property name="font">
+         <font>
+          <family>黑体</family>
+          <pointsize>12</pointsize>
+          <weight>75</weight>
+          <bold>true</bold>
+         </font>
+        </property>
+        <property name="text">
+         <string>左截图</string>
         </property>
        </widget>
       </item>
@@ -630,7 +651,7 @@
        <widget class="QPushButton" name="exchange_camera">
         <property name="minimumSize">
          <size>
-          <width>100</width>
+          <width>80</width>
           <height>30</height>
          </size>
         </property>
@@ -664,7 +685,7 @@
        <widget class="QPushButton" name="photo">
         <property name="minimumSize">
          <size>
-          <width>100</width>
+          <width>80</width>
           <height>30</height>
          </size>
         </property>
@@ -698,7 +719,7 @@
        <widget class="QPushButton" name="Calibration">
         <property name="minimumSize">
          <size>
-          <width>100</width>
+          <width>80</width>
           <height>30</height>
          </size>
         </property>
